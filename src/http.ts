@@ -1,47 +1,173 @@
-import { createServer as createHttpServer } from 'node:http';
+import { createServer as createHttpServer, type Server } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createServer } from './server.js';
-import { getCredentials, runWithCredentials } from './client.js';
+import { runWithCredentials } from './client.js';
 import { logger } from './utils/logger.js';
 import { verifyS2sHeader, S2S_HEADER } from './s2s-verify.js';
 
-const S2S_SECRET = process.env.CONDUIT_S2S_SECRET || '';
+/**
+ * HTTP transport fails closed (CWE-306).
+ *
+ * An empty CONDUIT_S2S_SECRET used to skip the X-Gateway-S2S check. Startup
+ * now refuses to listen unless the secret is set and is not a known
+ * placeholder. MCP_ALLOW_INSECURE_DEV=1 is the only bypass: it logs a
+ * warning, does not enforce S2S, and binds 127.0.0.1. A non-loopback
+ * MCP_HTTP_HOST is refused in that mode.
+ *
+ * A real secret honors MCP_HTTP_HOST, including 0.0.0.0. When that variable
+ * is unset the process keeps the historical 0.0.0.0 bind so container
+ * deploys stay reachable. The secret value is never logged.
+ *
+ * Gateway mode requires X-UISP-Api-Key and X-UISP-Base-URL on every /mcp
+ * request and does not fall back to UISP_* in the environment. /health and
+ * /healthz stay unauthenticated and do not read credentials. The stdio
+ * transport does not use S2S auth.
+ */
 
-function startHttpServer(): void {
+/** Public example values. A copied placeholder must not verify as a real secret. */
+const KNOWN_PLACEHOLDER_SECRETS = new Set([
+  'replace-with-a-real-secret',
+  'your-s2s-secret',
+  'your-secret',
+  'changeme',
+  'change-me',
+  'placeholder',
+  'secret',
+  'example',
+  'replace-me',
+  's2s-secret',
+]);
+
+const LOOPBACK_HOST = '127.0.0.1';
+
+const MISSING_S2S_SECRET_ERROR =
+  'Refusing to start HTTP transport: CONDUIT_S2S_SECRET is empty. ' +
+  'Set CONDUIT_S2S_SECRET to the gateway-provisioned secret (openssl rand -hex 32), ' +
+  'or set MCP_ALLOW_INSECURE_DEV=1 for local development only.';
+
+const PLACEHOLDER_S2S_SECRET_ERROR =
+  'Refusing to start HTTP transport: CONDUIT_S2S_SECRET is a known placeholder. ' +
+  'Generate a secret with `openssl rand -hex 32` and set CONDUIT_S2S_SECRET to that value.';
+
+const INSECURE_DEV_WARNING =
+  'SECURITY WARNING: CONDUIT_S2S_SECRET is empty and MCP_ALLOW_INSECURE_DEV=1. ' +
+  'HTTP /mcp is starting with service-to-service authentication DISABLED, bound to 127.0.0.1 only. ' +
+  'Local development only; do not expose this port.';
+
+function refuseStart(message: string): never {
+  logger.error(message);
+  process.exit(1);
+}
+
+function headerValue(value: string | string[] | undefined): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+/** 127.0.0.1, the rest of 127.0.0.0/8, localhost, and ::1. */
+function isLoopbackBindHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/^\[(.+)\]$/, '$1');
+  if (normalized === 'localhost' || normalized === '::1') return true;
+  const bare = normalized.startsWith('::ffff:') ? normalized.slice('::ffff:'.length) : normalized;
+  const parts = bare.split('.');
+  if (parts.length !== 4) return false;
+  if (parts.some((part) => !/^\d{1,3}$/.test(part) || Number(part) > 255)) return false;
+  return parts[0] === '127';
+}
+
+/**
+ * Fail closed. A known placeholder is never a configured secret, including
+ * when MCP_ALLOW_INSECURE_DEV=1 is also set. Empty is the only case the dev
+ * flag may bypass, and that bypass does not check X-Gateway-S2S.
+ */
+function resolveS2sSecret(env: NodeJS.ProcessEnv = process.env): { secret: string; insecureDev: boolean } {
+  const raw = (env.CONDUIT_S2S_SECRET ?? '').trim();
+  if (raw && KNOWN_PLACEHOLDER_SECRETS.has(raw.toLowerCase())) {
+    refuseStart(PLACEHOLDER_S2S_SECRET_ERROR);
+  }
+  if (raw) return { secret: raw, insecureDev: false };
+  if (env.MCP_ALLOW_INSECURE_DEV === '1') {
+    return { secret: '', insecureDev: true };
+  }
+  refuseStart(MISSING_S2S_SECRET_ERROR);
+}
+
+/**
+ * No real secret: force 127.0.0.1. A non-loopback MCP_HTTP_HOST refuses to
+ * start and is logged. A real secret honors MCP_HTTP_HOST; unset stays
+ * 0.0.0.0 so existing container deploys keep their bind.
+ */
+function resolveBindHost(insecureDev: boolean, env: NodeJS.ProcessEnv = process.env): string {
+  const configured = (env.MCP_HTTP_HOST ?? '').trim();
+  if (!insecureDev) {
+    return configured || '0.0.0.0';
+  }
+  if (configured === '' || isLoopbackBindHost(configured)) {
+    return LOOPBACK_HOST;
+  }
+  refuseStart(
+    `Refusing to start HTTP transport: MCP_ALLOW_INSECURE_DEV=1 without CONDUIT_S2S_SECRET ` +
+      `only listens on ${LOOPBACK_HOST}. MCP_HTTP_HOST=${configured} is not loopback. ` +
+      `Unset MCP_HTTP_HOST or set it to ${LOOPBACK_HOST}.`,
+  );
+}
+
+/**
+ * Start the UISP MCP Streamable HTTP server.
+ *
+ * Fails closed: a missing or blank CONDUIT_S2S_SECRET logs an error and calls
+ * process.exit(1) before anything listens. MCP_ALLOW_INSECURE_DEV=1 bypasses
+ * only a missing or blank secret: it skips X-Gateway-S2S and binds 127.0.0.1
+ * only. A placeholder or otherwise unusable secret always exits, with or
+ * without that flag. With a secret, every /mcp request must carry a valid
+ * X-Gateway-S2S header; /health stays unauthenticated.
+ *
+ * @returns The listening `Server`, once `listen` has succeeded.
+ * @throws Rejects with the bind error (for example EADDRINUSE or EACCES) if
+ *   the port cannot be bound.
+ */
+export async function startHttpTransport(): Promise<Server> {
+  const { secret: s2sSecret, insecureDev } = resolveS2sSecret();
   const port = parseInt(process.env.MCP_HTTP_PORT || '8080', 10);
-  const host = process.env.MCP_HTTP_HOST || '0.0.0.0';
+  const host = resolveBindHost(insecureDev);
+  if (insecureDev) {
+    // error level so LOG_LEVEL=warn|error cannot hide the bypass.
+    // Logged only after the loopback bind is accepted, so a refused
+    // non-loopback host does not claim the server is starting.
+    logger.error(INSECURE_DEV_WARNING);
+  }
   const isGatewayMode = process.env.AUTH_MODE === 'gateway';
 
   const httpServer = createHttpServer(async (req, res) => {
-    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    // Fixed base: a malformed Host header must not throw before auth.
+    let url: URL;
+    try {
+      url = new URL(req.url || '/', 'http://localhost');
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Bad request' }));
+      return;
+    }
 
-    if (url.pathname === '/health') {
-      // /health is container LIVENESS, not credential-readiness. In gateway
-      // mode, credentials arrive per-request via X-UISP-Api-Key/
-      // X-UISP-Base-URL, not at startup - checking getCredentials() here
-      // would 503 the container permanently regardless of whether any
-      // customer has connected yet.
-      const creds = getCredentials();
+    // /health is container LIVENESS, not credential-readiness. In gateway
+    // mode credentials arrive per-request via X-UISP-Api-Key and
+    // X-UISP-Base-URL, not at startup. This handler must not read vendor
+    // credentials.
+    if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/healthz')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          status: 'ok',
-          transport: 'http',
-          mode: isGatewayMode ? 'gateway' : 'standalone',
-          credentials: { configured: !!creds },
-          timestamp: new Date().toISOString(),
-        })
-      );
+      res.end(JSON.stringify({ status: 'ok' }));
       return;
     }
 
     if (url.pathname !== '/mcp') {
       res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not found', endpoints: ['/mcp', '/health'] }));
+      res.end(JSON.stringify({ error: 'Not found', endpoints: ['/mcp', '/health', '/healthz'] }));
       return;
     }
 
-    if (S2S_SECRET && !verifyS2sHeader(req.headers[S2S_HEADER] as string | undefined, S2S_SECRET)) {
+    // Empty s2sSecret is only reachable when MCP_ALLOW_INSECURE_DEV=1; startup
+    // refuses otherwise. A configured secret is always enforced, before any
+    // credential extraction.
+    if (s2sSecret && !verifyS2sHeader(headerValue(req.headers[S2S_HEADER]), s2sSecret)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
@@ -51,8 +177,14 @@ function startHttpServer(): void {
       return;
     }
 
-    const apiKey = isGatewayMode ? (req.headers['x-uisp-api-key'] as string | undefined) : undefined;
-    const baseUrl = isGatewayMode ? (req.headers['x-uisp-base-url'] as string | undefined) : undefined;
+    // node:http does not await this listener. Catch a rejected connect or
+    // handleRequest so one bad request cannot crash the process. The log
+    // stays generic because error text can echo tenant credentials.
+    const fail = (error: unknown): void => {
+      logger.error('MCP request failed', { errorName: error instanceof Error ? error.name : typeof error });
+      if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
+      if (!res.writableEnded) res.end(JSON.stringify({ error: 'Internal server error' }));
+    };
 
     const handle = async () => {
       // SECURITY-CRITICAL invariant: this transport MUST stay stateless
@@ -76,21 +208,56 @@ function startHttpServer(): void {
       await transport.handleRequest(req, res);
     };
 
-    if (apiKey && baseUrl) {
-      await runWithCredentials({ apiKey, baseUrl }, handle);
-    } else {
-      await handle();
+    // Gateway mode: credentials must arrive on every request via headers.
+    // Reject explicitly if missing rather than falling through — falling
+    // through would resolve UISP_API_KEY and UISP_BASE_URL from the process
+    // environment, which is not request-scoped.
+    if (isGatewayMode) {
+      const apiKey = headerValue(req.headers['x-uisp-api-key']);
+      const baseUrl = headerValue(req.headers['x-uisp-base-url']);
+
+      if (!apiKey || !baseUrl) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: 'Missing credentials. Gateway must inject X-UISP-Api-Key and X-UISP-Base-URL headers.',
+          })
+        );
+        return;
+      }
+
+      await runWithCredentials({ apiKey, baseUrl }, handle).catch(fail);
+      return;
     }
+
+    await handle().catch(fail);
   });
 
-  httpServer.listen(port, host, () => {
-    logger.info(`HTTP streaming server listening on ${host}:${port}`);
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once('error', reject);
+    httpServer.listen(port, host, () => {
+      httpServer.off('error', reject);
+      logger.info(`HTTP streaming server listening on ${host}:${port}`);
+      resolve();
+    });
   });
+
+  return httpServer;
 }
 
-const transport = process.env.MCP_TRANSPORT;
-if (transport === 'http') {
-  startHttpServer();
-} else {
-  import('./index.js');
+// Vitest imports this module to call startHttpTransport. Skip the CLI
+// entrypoint there. `node dist/http.js` still starts HTTP or falls through
+// to stdio, matching the previous module-load behavior.
+if (process.env.VITEST !== 'true') {
+  const transport = process.env.MCP_TRANSPORT;
+  if (transport === 'http') {
+    startHttpTransport().catch((error) => {
+      logger.error('Fatal startup error', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      process.exit(1);
+    });
+  } else {
+    import('./index.js');
+  }
 }
