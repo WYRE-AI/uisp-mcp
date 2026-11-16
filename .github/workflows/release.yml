@@ -21,7 +21,7 @@ jobs:
       packages: write
       id-token: write
       security-events: write
-    uses: wyre-technology/.github/.github/workflows/mcp-server-release.yml@06856d54d8829929e387523e6c1767d54416e978
+    uses: WYRE-AI/.github/.github/workflows/mcp-server-release.yml@542c9ed380fff70fab36234fc222cf9e7a076de9
     with:
       server-name: uisp-mcp
       image-name: ghcr.io/wyre-ai/uisp-mcp
